@@ -341,23 +341,36 @@ GET /t
             local Interpreter = Liquid.Interpreter
             local FileSystem = Liquid.FileSystem
             local InterpreterContext = Liquid.InterpreterContext
-            local var = {["aa"] =  "-----",  ["bb"] = { ["cc"] = "======" } }
-            local document = "{% if true  %} abc{{ aa }}defg {% endif %} {% include 'foo' for bb  %} {% include 'foo' %} "
-            local function mock_template()
-                return [[{% if true  %} 12345{{ cc }}6789 {% endif %}]]
+            local var = {
+                ["aa"] =  "-----",
+                ["bb"] = { ["cc"] = "======" },
+            }
+            local document = [[
+                {%- if true  -%}
+                    abc{{ aa }}defg
+                {%- endif %}
+                {%- include 'foo' for bb -%}
+                {%- include 'foo' -%}
+                {%- include 'bar' -%}
+            ]]
+            local filesystem = {
+                foo = [[{% if true  %} 12345{{ cc }}6789 {% endif %}]],
+                bar = [[{% include 'recursive' %}]],
+                recursive = [[bar]],
+            }
+            local function mock_template(name)
+                return filesystem[name]
             end
-            FileSystem.get = mock_template
             local lexer = Lexer:new(document)
             local parser = Parser:new(lexer)
             local interpreter = Interpreter:new(parser)
-            ngx.say( interpreter:interpret( InterpreterContext:new(var) ) )
+            ngx.say( interpreter:interpret( InterpreterContext:new(var), nil, nil, FileSystem:new(mock_template) ) )
         }
     }
 --- request
 GET /t
 --- response_body
- abc-----defg   12345======6789   123456789  
-
+abc-----defg 12345======6789  123456789 bar
 --- no_error_log
 [error]
 
@@ -534,5 +547,236 @@ GET /t
 --- response_body
  one = one two = two
 
+--- no_error_log
+[error]
+
+
+=== TEST 21: 'include' tag with custom filesystem
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            local Lexer = Liquid.Lexer
+            local Parser = Liquid.Parser
+            local Interpreter = Liquid.Interpreter
+            local FileSystem = Liquid.FileSystem
+            local InterpreterContext = Liquid.InterpreterContext
+            local var = {["aa"] =  "-----",  ["bb"] = { ["cc"] = "======" } }
+            local document = "{% if true  %} abc{{ aa }}defg {% endif %} {% include 'foo' for bb  %} {% include 'foo' %}"
+            local fs = { foo = [[{% if true  %} 12345{{ cc }}6789{% endif %}]] }
+            local function mock_template(location)
+                return fs[location]
+            end
+            local filesystem = FileSystem:new(mock_template)
+            local lexer = Lexer:new(document)
+            local parser = Parser:new(lexer)
+            local interpreter = Interpreter:new(parser)
+            ngx.say( interpreter:interpret( InterpreterContext:new(var), nil, nil, filesystem ) )
+        }
+    }
+--- request
+GET /t
+--- response_body
+ abc-----defg   12345======6789  123456789
+--- no_error_log
+[error]
+
+
+
+=== TEST 22 'include' tag missing template
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            local Lexer = Liquid.Lexer
+            local Parser = Liquid.Parser
+            local Interpreter = Liquid.Interpreter
+            local FileSystem = Liquid.FileSystem
+            local InterpreterContext = Liquid.InterpreterContext
+            local document = "{% include 'missing_template' %}"
+            local filesystem = FileSystem:new(function() end)
+            local lexer = Lexer:new(document)
+            local parser = Parser:new(lexer)
+            local interpreter = Interpreter:new(parser)
+            xpcall(function() interpreter:interpret(InterpreterContext:new({}), nil, nil, filesystem) end, ngx.say)
+        }
+    }
+--- request
+GET /t
+--- response_body_like chomp
+error when getting template "missing_template": cannot render empty template
+--- no_error_log
+[error]
+
+
+
+=== TEST 23 'include' tag error handling
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            local Lexer = Liquid.Lexer
+            local Parser = Liquid.Parser
+            local Interpreter = Liquid.Interpreter
+            local FileSystem = Liquid.FileSystem
+            local InterpreterContext = Liquid.InterpreterContext
+            local document = "{% include 'error' %}"
+            local function mock_template(location)
+                error('failed to load location error')
+            end
+            local filesystem = FileSystem:new(mock_template)
+            local lexer = Lexer:new(document)
+            local parser = Parser:new(lexer)
+            local interpreter = Interpreter:new(parser)
+            xpcall(function() interpreter:interpret(InterpreterContext:new({}), nil, nil, filesystem) end, ngx.say)
+        }
+    }
+--- request
+GET /t
+--- response_body_like chomp
+failed to load location error
+--- no_error_log
+[error]
+
+
+
+=== TEST 24 'include' tag custom error handling
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            local Lexer = Liquid.Lexer
+            local Parser = Liquid.Parser
+            local Interpreter = Liquid.Interpreter
+            local FileSystem = Liquid.FileSystem
+            local InterpreterContext = Liquid.InterpreterContext
+            local document = "{% include 'error' %}"
+            local function mock_template(location)
+                error('failed to load location error')
+            end
+            local function error_handler(location, error)
+                return string.format("location: %q, error: %s", location, error)
+            end
+            local filesystem = FileSystem:new(mock_template, error_handler)
+            local lexer = Lexer:new(document)
+            local parser = Parser:new(lexer)
+            local interpreter = Interpreter:new(parser)
+            ngx.say(interpreter:interpret(InterpreterContext:new({}), nil, nil, filesystem))
+        }
+    }
+--- request
+GET /t
+--- response_body_like chomp
+failed to load location error
+--- no_error_log
+[error]
+
+
+=== TEST 25: setting custom resource limit.
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            local document = "{% for i in (1..5) %}{{ i }}{% endfor %}"
+            local template = Liquid.Template:parse(document)
+            local limit = Liquid.ResourceLimit:new(0, 0, 3)
+            local ok, err = pcall(template.render, template, nil, nil, limit)
+            if not ok then ngx.say(err) end
+        }
+    }
+--- request
+GET /t
+--- response_body_like
+too many loopcount. limit num:3
+--- no_error_log
+[error]
+
+
+=== TEST 26: variable with __tostring metatable
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            local document = "str = {{ str }}, arr = {{ arr | join: '+' }}\n{%- if str == empty %}str is empty{%endif%}"
+            local template = Liquid.Template:parse(document)
+
+            local str = setmetatable({}, { __tostring = function() return 'val' end })
+            local context = Liquid.InterpreterContext:new({ str = str, arr = { str, str } })
+            ngx.say(assert(template:render(context)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+str = val, arr = val+val
+--- no_error_log
+[error]
+
+
+=== TEST 27: variable with __tostring metatable but returns nil
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            local document = "str = {{ str }}, arr = {{ arr | join: '+' }}\n{% if str == empty %}str is empty{%endif%}"
+            local template = Liquid.Template:parse(document)
+
+            local str = setmetatable({}, { __tostring = function()  end })
+            local context = Liquid.InterpreterContext:new({ str = str, arr = { str, str } })
+            ngx.say(assert(template:render(context)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+str = , arr = +
+str is empty
+--- no_error_log
+[error]
+
+
+
+=== TEST 27: print true value
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            ngx.say( Liquid.Template:parse([[
+              {{- val -}}
+            ]]):render( Liquid.InterpreterContext:new({ val = true }) ))
+        }
+    }
+--- request
+GET /t
+--- response_body
+true
+--- no_error_log
+[error]
+
+
+
+=== TEST 28: print false value
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua_block {
+            local Liquid = require 'liquid'
+            ngx.say( Liquid.Template:parse([[
+              {{- val -}}
+            ]]):render( Liquid.InterpreterContext:new({ val = false }) ))
+        }
+    }
+--- request
+GET /t
+--- response_body
+false
 --- no_error_log
 [error]

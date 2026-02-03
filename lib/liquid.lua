@@ -1,4 +1,5 @@
 local cjson = require 'cjson'
+local Datelib = require 'date'
 local Liquid = {}
 local Lexer = {}
 local Parser = {}
@@ -11,7 +12,11 @@ local Lazy = {}
 local ResourceLimit = {}
 local Nodetab = {}
 
-Liquid._VERSION = "0.0.1"
+local stringbyte = string.byte
+local stringchar = string.char
+local table_unpack = table.unpack
+
+Liquid._VERSION = "0.1.2"
 
 --Truthy and falsy
 local TRUE = "TRUE"    -- "true"
@@ -81,7 +86,7 @@ local CAPTURE = "CAPTURE"       --"capture"
 local ENDCAPTURE = "ENDCAPTURE" --"endcapture"
 local INCREMENT = "INCREMENT"   --"increment"
 local DECREMENT = "DECREMENT"   --"decrement"
--- Genertic token
+-- Generic token
 local NUM = "NUM"
 local STRING = "STRING"
 local ID = "ID"
@@ -98,6 +103,45 @@ local ENDRAW = "ENDRAW"
 --EOF
 local EOF = 'EOF'
 --
+--
+
+--- When replace_first filter was used, all the given chars should scaped at
+--lua way, no regexp option. To avoid future issues with different liquid
+--engines from other languages, this function sanitize the string to replace in
+--the correct way
+--Function is using bytes instead of chars, because comparision is faster in
+--this way. All was tested that is jit compatible to make it faster, no NYI
+--found
+--More information:
+--https://issues.redhat.com/browse/THREESCALE-4937
+--https://www.lua.org/pil/20.2.html
+--
+local special_chars = {
+  [40] = true, -- byte for char (
+  [41] = true, -- byte for char )
+  [46] = true, -- byte for char .
+  [37] = true, -- byte for char %
+  [43] = true, -- byte for char +
+  [45] = true, -- byte for char -
+  [42] = true, -- byte for char *
+  [63] = true, -- byte for char ?
+  [91] = true, -- byte for char [
+  [94] = true, -- byte for char ^
+  [36] = true, -- byte for char $
+}
+
+local function sanitize_replace(str)
+  local tbl = {stringbyte(str, 1, #str)}
+  local result = {}
+  for _, v in pairs(tbl) do
+    if special_chars[v] then
+      result[#result+1] = 37 -- append before a %
+    end
+    result[#result+1] = v
+  end
+  return stringchar(table_unpack(result))
+end
+
 -- Token
 local Token = {}
 --
@@ -1908,20 +1952,21 @@ function Interpreter:visit( node )
     elseif self[method] and type(self[method]) == 'function' then
         return self[method](self, node)
     else
-        return self:genertic_visit(node)
+        return self:generic_visit(node)
     end
 end
 --
-function Interpreter:genertic_visit( node )
+function Interpreter:generic_visit( node )
     -- body
     error('visit_' .. node:_name_() .. ' method not found')
 end
 --
-function Interpreter:interpret( context, filterset, resourcelimit )
+function Interpreter:interpret( context, filterset, resourcelimit, filesystem )
     -- body
     self.interpretercontext = context or InterpreterContext:new({})
     self.filterset = filterset or FilterSet:new()
     self.resourcelimit = resourcelimit or ResourceLimit:new()
+    self.filesystem = filesystem or FileSystem:new()
     return self:visit(self.tree)
 end
 function Interpreter:visit_Num( node )
@@ -1969,14 +2014,14 @@ function Interpreter:visit_Compoud( node )
     local output = {}
     for k,v in ipairs(node) do
         if self.interrupt_flag then
-            return table.concat(output, '')
+            return self:safe_concat(output, '')
         end
         local result = self:visit(v)
-        if result then
+        if result ~= nil then
             table.insert(output, result)
         end
     end
-    return table.concat(output, '')
+    return self:safe_concat(output, '')
 end
 --
 function Interpreter:visit_Branch( node )
@@ -2017,9 +2062,11 @@ function Interpreter:visit_BinOp( node )
                     return false
                 end
             end
+
             if left_name == "Empty" then
                 local right_value = self:visit(node.right)
-                if right_value == nil or right_value == '' then
+                local str = self:obj2str(right_value)
+                if not str or str == '' then
                     if op == EQ then
                         return true
                     else
@@ -2027,7 +2074,7 @@ function Interpreter:visit_BinOp( node )
                     end
                 end
                 if type(right_value) == "table" then
-                    if next(right_value) then
+                    if next(right_value) or (str and str ~= '') then
                         if op == NE then
                             return true
                         else
@@ -2044,15 +2091,18 @@ function Interpreter:visit_BinOp( node )
                 self:raise_error("Invalid empty comparision", node, 'op')
             else
                 local left_value = self:visit(node.left)
-                if left_value == nil or left_value == '' then
+                local str = self:obj2str(left_value)
+
+                if not str or str == '' then
                     if op == EQ then
                         return true
                     else
                         return false
                     end
                 end
+
                 if type(left_value) == "table" then
-                    if next(left_value) then
+                    if next(left_value) or (str and str ~= '') then
                         if op == NE then
                             return true
                         else
@@ -2078,13 +2128,11 @@ function Interpreter:visit_BinOp( node )
         local right_value = self:visit(node.right)
         if type(right_value) == "string" then
             if type(left_value) == "string" then
-                return string.find(left_value, left_value)
+                return string.find(left_value, right_value)
             elseif type(left_value) == "table" then
-                for i, v in left_value do
-                     if type(v) == "string" then
-                         if string.find(v, right_value) then
-                             return true
-                         end
+                for i, v in ipairs(left_value) do
+                     if type(v) == "string" and v == right_value then
+                        return true
                      end
                 end
                 return false
@@ -2233,7 +2281,7 @@ function Interpreter:visit_ForLoop( node )
         self.interrupt_type = nil
         self.interrupt_flag = false
     end
-    local result = table.concat(output, '')
+    local result = self:safe_concat(output, '')
     self.resourcelimit:check_length(#result)
     return result
 end
@@ -2335,7 +2383,7 @@ function Interpreter:visit_TableLoop( node )
         self.interrupt_type = nil
         self.interrupt_flag = false
     end
-    local result = table.concat(output, '\n')
+    local result = self:safe_concat(output, '\n')
     self.resourcelimit:check_length(#result)
     return result
 end
@@ -2382,9 +2430,10 @@ end
 function Interpreter:visit_Partial( node )
     -- body
     self.resourcelimit:check_subtemplate_num()
+    local filesystem = self.filesystem
     local t = node.parser_context
     local location = self:visit(node.location)
-    local file = FileSystem:new(location):genertic_get()
+    local file = filesystem:generic_get(location)
     local lexer = Lexer:new(file)
     local parser = Parser:new(lexer, node.parser_context)
     local context = self.interpretercontext
@@ -2400,7 +2449,7 @@ function Interpreter:visit_Partial( node )
         end
     end
     local interpreter = Interpreter:new(parser)
-    local result = interpreter:interpret(context, self.filterset, self.resourcelimit)
+    local result = interpreter:interpret(context, self.filterset, self.resourcelimit, self.filesystem)
     context:destroyframe()
     self.resourcelimit:check_length(#result)
     return result
@@ -2510,6 +2559,12 @@ function InterpreterContext:find_var( name )
     if name == nil then
         error("Invalid var name")
     end
+
+    -- Just returns the full context if the value if self.
+    if name == "self" then
+        return self.stackframe
+    end
+
     local value = nil
     local length = #(self.stackframe)
     local step = -1
@@ -2547,27 +2602,36 @@ end
 -------------------------------------------------------------ParserContext end ---------------------------------------------------------
 -------------------------------------------------------------FileSystem begin ---------------------------------------------------------
 -- local FileSystem = {}
-function FileSystem:new( location )
+function FileSystem:new( get, error_handler )
     -- body
     local instance = {}
     setmetatable(instance, {__index = FileSystem})
-    instance.location = location
+    instance.get = get
     instance.text = nil
+    instance.error_handler = error_handler
     return instance
 end
 --
-function FileSystem:genertic_get( ... )
+function FileSystem:generic_get( location )
+    local error_handler = self.error_handler
     -- body
     if self.get and type(self.get) == "function" then
-        local status, err = pcall(self.get, self.location)
-        if status then
-            return err
+        local ok, ret = pcall(self.get, location)
+
+        if ok and ret then
+            return tostring(ret)
+        elseif ok then
+            return error_handler(location, "cannot render empty template" )
         else
-            error("get template: " .. location .. " fail by user self defined get method" .. tostring(err))
+            return error_handler(location, ret)
         end
     else
-         error("method to get template file is not defined !!")
+        return error_handler(location, "method to get template file is not defined !!")
     end
+end
+--
+function FileSystem.error_handler(location, err)
+    return error(string.format("error when getting template %q: %s", location, err))
 end
 -------------------------------------------------------------FileSystem end ---------------------------------------------------------
 -------------------------------------------------------------Lazy begin ---------------------------------------------------------
@@ -2673,12 +2737,14 @@ function Template:parse( text , parser_context)
     instance.interpreter = Interpreter:new(instance.parser)
     return instance
 end
-function Template:render( context, filterset, resourcelimit )
+function Template:render( context, filterset, resourcelimit, filesystem )
     -- body
     local t_interpretercontext = context or InterpreterContext:new({})
     local t_filterset = filterset or FilterSet:new()
     local t_resourcelimit = resourcelimit or ResourceLimit:new()
-    return self.interpreter:interpret( t_interpretercontext, t_filterset, t_resourcelimit )
+    local t_filesystem = filesystem or FileSystem:new()
+
+    return self.interpreter:interpret( t_interpretercontext, t_filterset, t_resourcelimit, t_filesystem )
 end
 ------------------------------------------------------------- friendly interface end ---------------------------------------------------------
 ------------------------------------------------------------- helper methods begin ---------------------------------------------------------
@@ -2691,19 +2757,38 @@ function string:rstrip( ... )
     local ws = [[(\s*\z)]]
     return ngx.re.sub(self, ws, '')
 end
-function Interpreter:obj2str( obj )
-    -- body
-    local obj_type = type(obj)
-    if obj_type == "nil" then
-        return ''
-    elseif obj_type == "number" then
-        return tostring(obj)
-    elseif obj_type == "string" then
-        return obj
-    elseif obj_type == "Boolean" then
-        return tostring(obj)
-    elseif obj_type == "table" then
-        return nil
+
+do
+    local empty_t = {}
+    local function mt__tostring(obj)
+        return (getmetatable(obj) or empty_t).__tostring
+    end
+
+    function Interpreter:obj2str( obj )
+        -- body
+        local obj_type = type(obj)
+        if obj_type == "nil" then
+            return ''
+        elseif obj_type == "number" then
+            return tostring(obj)
+        elseif obj_type == "string" then
+            return obj
+        elseif obj_type == "boolean" then
+            return tostring(obj)
+        elseif type(mt__tostring(obj)) == 'function' then
+            return tostring(obj) or ''
+        end
+    end
+
+    function Interpreter:safe_concat(t, d)
+        local tmp = {}
+
+        -- string keys are ignored by concat anyway
+        for i,v in ipairs(t) do
+            tmp[i] = Interpreter:obj2str(v)
+        end
+
+        return table.concat(tmp, d)
     end
 end
 ------------------------------------------------------------- helper methods end ---------------------------------------------------------
@@ -2740,33 +2825,52 @@ function FilterSet:find_filter( filter_name )
        return self.filterset[filter_name]
     end
 end
+
+local function is_iterator(o)
+    local mt = getmetatable(o)
+
+    return mt and mt.__ipairs
+end
+
+local function iterator(o)
+    if type(o) == 'table' or is_iterator(o) then
+        return o
+    else
+        return { o }
+    end
+end
+
 --=== array filter begin
 local function join( a, b)
     -- body
-    return table.concat(a, b)
+    return Interpreter:safe_concat(iterator(a), b or ' ')
 end
 local function first( a )
     -- body
-    return a[1]
+    return iterator(a)[1]
+end
+local function size( a )
+    -- body
+    return(#iterator(a))
 end
 local function last( a )
     -- body
-    return a[#a]
+    return iterator(a)[size(a)]
 end
 local function concat( a, b)
     -- body
     local temp = {}
-    for i,v in ipairs(a) do
+    for i,v in ipairs(iterator(a)) do
         table.insert(temp, v)
     end
-    for i,v in ipairs(b) do
+    for i,v in ipairs(iterator(b)) do
         table.insert(temp, v)
     end
     return temp
 end
 local function index( a, b)
     -- body
-    return a[(b + 1)]
+    return iterator(a)[(b + 1)]
 end
 local function map( a, map_field)
     -- body
@@ -2774,25 +2878,23 @@ local function map( a, map_field)
     for i,v in ipairs(a) do
         table.insert(temp, v[map_field])
     end
-    return table.concat(temp, '')
+    return join(temp, '')
 end
 local function reverse( a )
     -- body
     local temp = {}
-    local num = #a
+    local it = iterator(a)
+    local num = size(a)
     for k = num, 1, -1 do
-        table.insert(temp, a[k])
+        table.insert(temp, it[k])
     end
     return temp
 end
-local function size( a )
-    -- body
-    return(#a)
-end
+
 local function sort( a, sort_field)
     -- body
     local t = {}
-    for i,v in ipairs(a) do
+    for i,v in ipairs(iterator(a)) do
         table.insert(t, v)
     end
     if not sort_field then
@@ -2808,7 +2910,7 @@ local function uniq( a )
     -- body
     local t = {}
     local result = {}
-    for i,v in ipairs(a) do
+    for i,v in ipairs(iterator(a)) do
         local k = cjson.encode(v)
         if not t[k] then
             t[k] = true
@@ -2884,19 +2986,19 @@ local function prepend( str, str_prepend )
 end
 local function remove( str , pattern)
     -- body
-    return string.gsub(str, pattern, '')
+    return string.gsub(str, sanitize_replace(pattern), '')
 end
 local function remove_first( str, pattern)
     -- body
-    return string.gsub(str, pattern,'', 1)
+    return string.gsub(str, sanitize_replace(pattern),'', 1)
 end
 local function replace( str, pattern, str_replace )
     -- body
-    return string.gsub(str, pattern, str_replace)
+    return string.gsub(str, sanitize_replace(pattern), str_replace)
 end
 local function replace_first( str, pattern, str_replace  )
     -- body
-    return string.gsub(str, pattern, str_replace, 1)
+    return string.gsub(str, sanitize_replace(pattern), str_replace, 1)
 end
 local function slice( str, from, to )
     -- body
@@ -2921,7 +3023,7 @@ local function split( str, pattern )
             end
         end
     until from == nil
-    if index < #str then
+    if index <= #str then
         table.insert(result, string.sub(str, index))
     end
     return result
@@ -2973,12 +3075,48 @@ local function str_reverse( str )
     return string.reverse(str)
 end
 --=== String filter end
+--=== Date filter
+local function date_parse(obj)
+    local dateobj = Datelib(obj)
+    return dateobj
+end
+
+local function date_now()
+    local dateobj = Datelib(true)
+    return dateobj
+end
+
+local date_func =
+{
+    ["now"] = date_now,
+    ["default"] = date_parse,
+}
+
+local function date(obj, format)
+    local date_obj = nil;
+    local func = date_func[obj]
+    if func then 
+        date_obj = func(obj)
+    else
+        date_obj = date_func["default"](obj)
+    end
+    return date_obj:fmt(format)
+end
+--=== Date filter end
 --=== Additional filter begin
 local function json( obj )
     -- body
     return cjson.encode(obj)
 end
+
+
+local function get(obj, key)
+    return obj[key]
+end
+
 --=== Additional filter end
+
+
 
 --========================================================== add filers to FilterSet instance================================
 --Array filter 
@@ -3023,9 +3161,12 @@ FilterSet:add_filter("url_encode", url_encode )
 FilterSet:add_filter("url_decode", url_decode )
 FilterSet:add_filter("str_reverse", str_reverse )
 
+--Date filter
+FilterSet:add_filter("date", date )
+
 --Additinal filter
 FilterSet:add_filter("json", json )
-
+FilterSet:add_filter("get", get)
 
 
 
@@ -3039,6 +3180,7 @@ Liquid.Parser = Parser
 Liquid.Interpreter = Interpreter
 Liquid.InterpreterContext = InterpreterContext
 Liquid.FilterSet = FilterSet
+Liquid.ResourceLimit = ResourceLimit
 Liquid.FileSystem = FileSystem
 Liquid.ParserContext = ParserContext
 Liquid.Lazy = Lazy
